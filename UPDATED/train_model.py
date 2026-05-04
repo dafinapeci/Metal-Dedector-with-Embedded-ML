@@ -1,10 +1,7 @@
 # ============================================================
 # METAL DETECTOR — TRAINING PIPELINE
 # CENG318 Project — Prepared by: Dafina Peci
-# Best performing version (Run 4): 79.6% accuracy
-#   - 50 trees, max_depth=10, no class weights
-#   - not_flat threshold: 0.5
-#   - 61 engineered features (fark + norm + slopes + energy + decay_rate)
+# Modified for 20-Column CSVs and 27 Key Features
 # ============================================================
 
 import pandas as pd
@@ -19,6 +16,9 @@ from sklearn.model_selection import train_test_split, cross_val_score, Stratifie
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from xgboost import XGBClassifier # (You may need to run: pip install xgboost)
 from sklearn.metrics import classification_report, confusion_matrix
 import m2cgen as m2c
 import warnings
@@ -27,37 +27,18 @@ warnings.filterwarnings('ignore')
 # ─── CONFIGURATION ────────────────────────────────────────
 FILE_CLASS_MAP = {
     # ── Aluminium (class 1) ──────────────────────────────
-    "new_aluminium_can_2cm":           ("Aluminium", 1),
-    "new_aluminium_can_4cm":           ("Aluminium", 1),
-    "new_aluminium_foil_updown":       ("Aluminium", 1),
-    "new_aluminium_foil_sides":        ("Aluminium", 1),
-    "new_aluminium_foil2_updown":      ("Aluminium", 1),
-    "new_aluminium_foil2_sides":       ("Aluminium", 1),
-    "new_aluminium_can_less1cm":       ("Aluminium", 1),
-    "new_aluminium_can_sides":         ("Aluminium", 1),
-    "new_aluminium_can_movingupdown":  ("Aluminium", 1),
-    "new_aluminium_can2_sides":        ("Aluminium", 1),
-    "new_aluminium_can2_movingupdown": ("Aluminium", 1),
-    "new_aluminium_foil_2cm":          ("Aluminium", 1),
-    "new_aluminium_foil_4cm":          ("Aluminium", 1),
-    "new_aluminium_foil_less1cm":      ("Aluminium", 1),
+    "aluminium":           ("Aluminium", 0),
+    "aluminium2":           ("Aluminium", 0),
 
-    # ── Steel (class 4) ──────────────────────────────────
-    "new_steel_knife_less1cm":         ("Steel",     4),
-    "new_steel_knife2cm":              ("Steel",     4),
-    "new_steel_knife4cm":              ("Steel",     4),
-    "new_steel_knife_updown":          ("Steel",     4),
-    "new_steel_knife_sides":           ("Steel",     4),
-    "new_steel_spoon_2cm":             ("Steel",     4),
-    "new_steel_spoon_4cm":             ("Steel",     4),
-    "new_steel_spoon_less1cm":         ("Steel",     4),
-    "new_steel_spoon_moving_updown":   ("Steel",     4),
-    "new_steel_spoon_sides":           ("Steel",     4),
+    # ── Steel (class 2) ──────────────────────────────────
+    "steel":               ("Steel",     1),
+    "steel1":               ("Steel",     1),
+
+
 
     # ── NoMetal (class 0) ────────────────────────────────
-    "new_empty_space":                 ("NoMetal",   0),
-    "new_plastic":                     ("NoMetal",   0),
-    "new_porcelain":                   ("NoMetal",   0),
+    # Assuming you still have empty files. If not, add an "empty" file!
+
 }
 
 DATA_FOLDER   = "."
@@ -65,15 +46,15 @@ OUTPUT_FOLDER = "./output"
 RANDOM_SEED   = 42
 CSV_COLS      = 20
 
-NUM_ENGINEERED_FEATURES = 61  # 20+20+19+1+1
+NUM_ENGINEERED_FEATURES = 27  # 20 + 4 + 1 + 2
 # ──────────────────────────────────────────────────────────
 
 np.random.seed(RANDOM_SEED)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-RAW_COLS     = [f"raw_t{i}"  for i in range(CSV_COLS)]
+# WE NOW ONLY EXPECT 20 COLUMNS (The Fark/Delta values)
 FARK_COLS    = [f"fark_t{i}" for i in range(CSV_COLS)]
-ALL_CSV_COLS = RAW_COLS + FARK_COLS
+ALL_CSV_COLS = FARK_COLS
 
 CLASS_NAMES = {}
 
@@ -93,8 +74,9 @@ for fname, (class_name, class_idx) in FILE_CLASS_MAP.items():
 
     df = pd.read_csv(filepath, header=None)
 
-    if df.shape[1] != 40:
-        print(f"  ERROR: {fname}.csv has {df.shape[1]} columns, need 40. Skipping.")
+    # CHANGED: Now checks for 20 columns instead of 40
+    if df.shape[1] != 20:
+        print(f"  ERROR: {fname}.csv has {df.shape[1]} columns, need 20. Skipping.")
         continue
 
     df.columns = ALL_CSV_COLS
@@ -108,6 +90,10 @@ for fname, (class_name, class_idx) in FILE_CLASS_MAP.items():
 
     print(f"  {fname}: {len(df)} rows → class {class_idx} ({class_name})")
     all_dfs.append(df)
+
+if len(all_dfs) == 0:
+    print("\nCRITICAL ERROR: No valid CSV files were loaded. Check your folder and file names!")
+    exit()
 
 data = pd.concat(all_dfs, ignore_index=True)
 sorted_classes = sorted(CLASS_NAMES.keys())
@@ -133,7 +119,7 @@ y = data["label"].values.astype(int)
 # Delta values must be 0-4095
 valid_range = np.all((fark_raw >= 0) & (fark_raw <= 4095), axis=1)
 
-# Lenient flat check — keeps weak steel-at-distance signals
+# Lenient flat check
 not_flat = (np.max(fark_raw, axis=1) - np.min(fark_raw, axis=1)) > 0.5
 
 mask = valid_range & not_flat
@@ -144,48 +130,45 @@ fark_raw = fark_raw[mask]
 y        = y[mask]
 
 # ============================================================
-# STEP 2B: FEATURE ENGINEERING
+# STEP 2B: FEATURE ENGINEERING (27 Features)
 # ============================================================
 print()
 print("=" * 55)
-print("STEP 2B: Feature Engineering (61 features total)")
+print("STEP 2B: Feature Engineering (27 features total)")
 print("=" * 55)
 
-epsilon = 1e-6
-
-# 1. Raw delta (20)
+# 1. Ham Farklar (Delta) - [20 Özellik]
 feat_delta = fark_raw
 
-# 2. Normalized shape (20) — distance-independent
-feat_norm = fark_raw / (fark_raw[:, 0:1] + epsilon)
+# 2. Bölgesel Enerjiler (Eğri Altında Kalan Alan) - [4 Özellik]
+q1_energy = np.sum(np.abs(fark_raw[:, 0:5]), axis=1, keepdims=True)
+q2_energy = np.sum(np.abs(fark_raw[:, 5:10]), axis=1, keepdims=True)
+q3_energy = np.sum(np.abs(fark_raw[:, 10:15]), axis=1, keepdims=True)
+q4_energy = np.sum(np.abs(fark_raw[:, 15:20]), axis=1, keepdims=True)
+feat_quarters = np.hstack([q1_energy, q2_energy, q3_energy, q4_energy])
 
-# 3. Consecutive slopes (19) — decay speed
-feat_slopes = np.diff(fark_raw, axis=1)
+# 3. Sinyal Varyansı (Pürüzlülük/Dalgalanma) - [1 Özellik]
+feat_variance = np.var(fark_raw, axis=1, keepdims=True)
 
-# 4. Total energy (1)
-feat_energy = fark_raw.sum(axis=1, keepdims=True)
+# 4. Kısmi Eğimler (Saldırı ve Sönümleme Hızı) - [2 Özellik]
+entry_slope = np.mean(fark_raw[:, 3:6], axis=1, keepdims=True) - np.mean(fark_raw[:, 0:3], axis=1, keepdims=True)
+exit_slope  = np.mean(fark_raw[:, 17:20], axis=1, keepdims=True) - np.mean(fark_raw[:, 14:17], axis=1, keepdims=True)
+feat_macro_slopes = np.hstack([entry_slope, exit_slope])
 
-# 5. Decay rate (1) — ferrous indicator
-early_avg  = fark_raw[:, :3].mean(axis=1, keepdims=True)
-late_avg   = fark_raw[:, 17:].mean(axis=1, keepdims=True)
-feat_decay = early_avg - late_avg
-
-X = np.hstack([feat_delta, feat_norm, feat_slopes, feat_energy, feat_decay])
+# Combine exactly 27 features
+X = np.hstack([feat_delta, feat_quarters, feat_variance, feat_macro_slopes])
 
 print(f"  Feature breakdown:")
-print(f"    Delta values (fark_t0..19):     20")
-print(f"    Normalized shape (norm_t0..19): 20")
-print(f"    Consecutive slopes:             19")
-print(f"    Total energy:                    1")
-print(f"    Decay rate (early-late):         1")
+print(f"    Ham Farklar (fark_t0..19):      20")
+print(f"    Bölgesel Enerjiler (Q1..Q4):     4")
+print(f"    Sinyal Varyansı:                 1")
+print(f"    Kısmi Eğimler (Giriş, Çıkış):    2")
 print(f"    ─────────────────────────────────")
 print(f"    Total:                          {X.shape[1]}")
 
 feat_names = (
-    [f"fark_t{i}"       for i in range(20)] +
-    [f"norm_t{i}"       for i in range(20)] +
-    [f"slope_{i}_{i+1}" for i in range(19)] +
-    ["energy", "decay_rate"]
+    [f"fark_t{i}" for i in range(20)] +
+    ["q1_energy", "q2_energy", "q3_energy", "q4_energy", "variance", "entry_slope", "exit_slope"]
 )
 
 # ============================================================
@@ -202,8 +185,10 @@ models = {
     "k-NN (k=5)":         KNeighborsClassifier(n_neighbors=5),
     "SVM (RBF, C=10)":    SVC(kernel='rbf', C=10, gamma='scale',
                                random_state=RANDOM_SEED),
-    "Random Forest (50)": RandomForestClassifier(n_estimators=50,
-                               max_depth=10, random_state=RANDOM_SEED),
+    "Random Forest (15)": RandomForestClassifier(n_estimators=15, max_depth=6, random_state=RANDOM_SEED, n_jobs=-1),
+    "Logistic Regression": LogisticRegression(max_iter=1000, random_state=RANDOM_SEED),
+    "Neural Net (MLP)": MLPClassifier(hidden_layer_sizes=(15,), max_iter=500, random_state=RANDOM_SEED),
+    "XGBoost": XGBClassifier(n_estimators=10, max_depth=4, learning_rate=0.1, random_state=RANDOM_SEED),
 }
 
 cv_results = {}
@@ -228,27 +213,38 @@ X_train, X_test, y_train, y_test = train_test_split(
 )
 print(f"  Train: {len(X_train)}  Test: {len(X_test)}")
 
-knn_final = KNeighborsClassifier(n_neighbors=5)
-svm_final = SVC(kernel='rbf', C=10, gamma='scale', random_state=RANDOM_SEED)
-rf_final  = RandomForestClassifier(
-    n_estimators=50,
-    max_depth=10,
-    random_state=RANDOM_SEED,
-    n_jobs=-1
-)
+# --- 1. INSTANTIATE THE MODELS ---
+knn_final     = KNeighborsClassifier(n_neighbors=5)
+svm_final     = SVC(kernel='rbf', C=10, gamma='scale', random_state=RANDOM_SEED)
+rf_final      = RandomForestClassifier(n_estimators=15, max_depth=6, random_state=RANDOM_SEED, n_jobs=-1)
+log_reg       = LogisticRegression(max_iter=1000, random_state=RANDOM_SEED)
+mlp_final     = MLPClassifier(hidden_layer_sizes=(15,), max_iter=500, random_state=RANDOM_SEED)
+xgboost_final = XGBClassifier(n_estimators=10, max_depth=4, learning_rate=0.1, random_state=RANDOM_SEED)
 
+# --- 2. FIT THE MODELS ---
 knn_final.fit(X_train, y_train)
 svm_final.fit(X_train, y_train)
 rf_final.fit(X_train, y_train)
+log_reg.fit(X_train, y_train)
+mlp_final.fit(X_train, y_train)
+xgboost_final.fit(X_train, y_train)
 
-knn_acc = knn_final.score(X_test, y_test)
-svm_acc = svm_final.score(X_test, y_test)
-rf_acc  = rf_final.score(X_test,  y_test)
+# --- 3. SCORE THE MODELS ---
+knn_acc     = knn_final.score(X_test, y_test)
+svm_acc     = svm_final.score(X_test, y_test)
+rf_acc      = rf_final.score(X_test,  y_test)
+log_reg_acc = log_reg.score(X_test, y_test)
+mlp_acc     = mlp_final.score(X_test, y_test)
+xgb_acc     = xgboost_final.score(X_test, y_test)
 
+# --- 4. PRINT RESULTS ---
 print(f"\n  Test set results:")
-print(f"  k-NN:           {knn_acc*100:.1f}%")
-print(f"  SVM:            {svm_acc*100:.1f}%")
-print(f"  Random Forest:  {rf_acc*100:.1f}%")
+print(f"  k-NN:                 {knn_acc*100:.1f}%")
+print(f"  SVM:                  {svm_acc*100:.1f}%")
+print(f"  Random Forest:        {rf_acc*100:.1f}%")
+print(f"  Logistic Regression:  {log_reg_acc*100:.1f}%")
+print(f"  Neural Net (MLP):     {mlp_acc*100:.1f}%")
+print(f"  XGBoost:              {xgb_acc*100:.1f}%")
 
 y_pred = rf_final.predict(X_test)
 print("\n  Random Forest — Per-class Report:")
@@ -298,7 +294,7 @@ plt.bar(range(top_n), importances[top_idx],
 plt.xticks(range(top_n),
            [feat_names[i] for i in top_idx],
            rotation=40, ha='right', fontsize=9)
-plt.title(f"Top {top_n} Feature Importances — Random Forest (Gini)",
+plt.title(f"Top {top_n} Feature Importances (27 Features)",
           fontweight='bold')
 plt.ylabel("Importance Score")
 plt.grid(True, axis='y', alpha=0.3)
@@ -324,18 +320,19 @@ plt.savefig(os.path.join(OUTPUT_FOLDER, "confusion_matrix.png"),
 plt.close()
 print("  confusion_matrix.png → Figure 15 in report")
 
-# Figure D — Class separability by energy
+# Figure D — Class separability by Variance (Updated)
 fig, ax = plt.subplots(figsize=(9, 4))
 for idx in sorted_classes:
     mask_c = y == idx
-    energy_vals = X[mask_c][:, 59]
-    ax.scatter(np.where(mask_c)[0], energy_vals,
+    # index 24 is "variance" in our new 27-feature array
+    variance_vals = X[mask_c][:, 24]
+    ax.scatter(np.where(mask_c)[0], variance_vals,
                label=CLASS_NAMES[idx],
                color=colors[idx % len(colors)],
                alpha=0.6, s=20)
 ax.set_xlabel("Sample index")
-ax.set_ylabel("Total delta energy")
-ax.set_title("Class Separability — Total Energy per Sample",
+ax.set_ylabel("Signal Variance")
+ax.set_title("Class Separability — Signal Variance per Sample",
              fontweight='bold')
 ax.legend()
 ax.grid(True, alpha=0.3)
@@ -361,13 +358,13 @@ header = f"""// =====================================================
 // Model: Random Forest ({len(rf_final.estimators_)} trees, max_depth={rf_final.max_depth})
 // Input:  float features[{NUM_ENGINEERED_FEATURES}]
 //   [0..19]  fark_t0..19        (raw delta values)
-//   [20..39] norm_t0..19        (normalized shape)
-//   [40..58] slope_i_(i+1)      (consecutive slopes)
-//   [59]     energy              (sum of fark values)
-//   [60]     decay_rate          (early - late avg)
+//   [20..23] q1..q4 energies    (regional energies)
+//   [24]     variance           (signal variance)
+//   [25]     entry_slope        (macro entry slope)
+//   [26]     exit_slope         (macro exit slope)
 // Output: {', '.join([f"{i}={CLASS_NAMES[i]}" for i in sorted_classes])}
 // Training accuracy: {rf_acc*100:.1f}%
-// CV accuracy:       {cv_results['Random Forest (50)'].mean()*100:.1f}%
+// CV accuracy:       {cv_results['Random Forest (15)'].mean()*100:.1f}%
 // =====================================================
 
 #ifndef METAL_MODEL_H
@@ -426,7 +423,7 @@ stats = {
     "test_size":  int(len(X_test)),
     "num_features": NUM_ENGINEERED_FEATURES,
     "feature_description": (
-        "20 fark (delta) + 20 normalized shape + 19 slopes + 1 energy + 1 decay_rate"
+        "20 fark (delta) + 4 quarters + 1 variance + 2 macro slopes"
     ),
     "cross_validation_5fold": {
         name: {
@@ -437,10 +434,13 @@ stats = {
     "test_set_accuracy": {
         "kNN_k5":       f"{knn_acc*100:.1f}%",
         "SVM_RBF":      f"{svm_acc*100:.1f}%",
-        "RandomForest": f"{rf_acc*100:.1f}%"
+        "RandomForest": f"{rf_acc*100:.1f}%",
+        "LogisticReg":  f"{log_reg_acc*100:.1f}%",
+        "MLP":          f"{mlp_acc*100:.1f}%",
+        "XGBoost":      f"{xgb_acc*100:.1f}%"
     },
-    "selected_model": "Random Forest (50 trees, max_depth=10)",
-    "selection_reason": "Best accuracy, exportable to C via m2cgen, safe file size for ESP32"
+    "selected_model": "Random Forest (15 trees, max_depth=6)",
+    "selection_reason": "Testing all alternatives to find the best fit for ESP32 memory constraints."
 }
 with open(os.path.join(OUTPUT_FOLDER, "report_stats.json"), "w") as f:
     json.dump(stats, f, indent=2)
